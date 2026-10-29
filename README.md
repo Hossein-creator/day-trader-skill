@@ -132,6 +132,8 @@ python3 trader-scanner/scan.py orb --at 10:15                          # opening
 python3 trader-news/news.py --tickers TSLA --hours 12                  # headlines, 8-Ks, today's move
 python3 trader-entry/entry.py check TSLA --setup orb                   # waiting / triggered / expired
 python3 trader-entry/entry.py watch TSLA --every 30                    # bar by bar until it triggers
+python3 trader-entry/entry.py check TSLA --setup sr                    # first close above resistance
+python3 trader-entry/entry.py check TSLA --levels                      # support and resistance, 4 prior days
 python3 trader-exit/exit.py plan --stop or-mid --target 1R --write     # -> trader/plan.json
 python3 trader-timemachine/timemachine.py run --write                  # 10,000 replays + the history
 python3 trader-budget/size.py --write                                  # -> trader/orders.json

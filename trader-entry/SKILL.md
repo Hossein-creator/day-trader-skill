@@ -4,15 +4,18 @@ description: >-
   Entry Timer. Watches a setup bar by bar and tells you the moment to get in.
   Reads free Yahoo 1-minute or 5-minute bars, builds the opening range (the
   first 15 minutes by default) and calls the entry on the first completed bar
-  that CLOSES above the range high, or above a level you give it (like a
-  20-day high from the scanner), with an optional volume check. Says waiting
+  that CLOSES above the range high, above the nearest resistance zone (support
+  and resistance from the prior sessions' swing highs and lows, session highs
+  and lows and the prior close), or above a level you give it (like a 20-day
+  high from the scanner), with an optional volume check. Says waiting
   and how far, triggered with the time and the price, expired, or not open
   yet, and writes trader/entry.json for /trader-exit. Long side only. It never
   places an order. Use when the user says "tell me when to get in", "watch
   TSLA", "has it broken out", "did it break the opening range", "entry
-  signal", "time my entry", "check my watchlist", or after /trader-scanner
+  signal", "time my entry", "check my watchlist", "support and resistance",
+  "where is resistance", "is it breaking resistance", or after /trader-scanner
   and /trader-news, before /trader-exit.
-argument-hint: "[TICKER] [--setup orb|level] [--interval 5m|1m]"
+argument-hint: "[TICKER] [--setup orb|sr|level] [--levels] [--interval 5m|1m]"
 ---
 
 # trader-entry
@@ -30,12 +33,15 @@ people money, and a clean signal does not change that.
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA                  # 15-minute opening range, 5-minute bars
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --write          # also save trader/entry.json
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --setup level --level 371.20
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --setup sr       # first close above the nearest resistance
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --levels         # orb, plus support and resistance
 python3 "${CLAUDE_SKILL_DIR}/entry.py" check TSLA --interval 1m --min-volume-x 1.5
 python3 "${CLAUDE_SKILL_DIR}/entry.py" watch TSLA --until 15:30    # one line per closed bar, stops on the trigger
 python3 "${CLAUDE_SKILL_DIR}/entry.py" watchlist                   # every hit in trader/watchlist.json
 ```
 
-Other flags: `--or-minutes N` (default 15), `--json`, `--offline FILE` (a
+Other flags: `--or-minutes N` (default 15), `--sr-days N` (prior sessions
+for support and resistance, default 4), `--json`, `--offline FILE` (a
 saved Yahoo chart JSON, `.json` or `.json.gz`, or a folder of
 `<TICKER>.json`), `--now "2026-10-19 10:15"` (New York time) to replay a day.
 `watch` with `--now` or `--offline` runs on a simulated clock and replays the
@@ -47,14 +53,17 @@ day bar by bar without waiting.
 | --- | --- |
 | `trader/watchlist.json` | the scanner's hits (`hits[].symbol`), for `watchlist` |
 | `trader/config.json` | `no_entries_before` (09:45) and `no_entries_after` (15:30), New York time. Optional |
-| Yahoo chart API | today's bars, `range=1d&interval=5m` (or `1m`): free, unofficial, can lag |
-| `trader/entry.json` | with `check --write`, or when `watch` triggers: symbol, setup, status, time, bar, price, level, opening range |
+| Yahoo chart API | today's bars, `range=1d&interval=5m` (or `1m`): free, unofficial, can lag. With `--setup sr`, `--levels` or `--sr-days`, `range=5d` (or longer) for the prior sessions |
+| `trader/entry.json` | with `check --write`, or when `watch` triggers: symbol, setup, status, time, bar, price, level, opening range, and `levels` (support and resistance) when asked for |
 
 ## The rule
 
 - **Opening range (orb).** The high and low of the first 15 minutes: the
   9:30, 9:35 and 9:40 five-minute bars, or fifteen 1-minute bars. The level
   to beat is the range high.
+- **Support/resistance (sr).** The opening range first, then the nearest
+  resistance zone whose top is over the range high. The level to beat is the
+  zone's TOP: a close inside the zone is not through it. See below.
 - **Level.** A price you give, like a 20-day high from `/trader-scanner`.
 - **The trigger** is the first completed bar after the range that CLOSES
   above the level. A wick above is not a trigger. A close exactly at the
@@ -73,11 +82,36 @@ day bar by bar without waiting.
   triggered, expired, or no data. Before 9:30: not open yet. Before 9:45: the
   range is still forming. Weekends and NYSE holidays: the market is closed.
 
+## Support and resistance
+
+Read from the prior sessions only (`--sr-days`, default 4: what Yahoo's
+5-day chart holds besides today), regular hours, so the zones are known
+before the open and never move during the day.
+
+- **Candidates.** Each session's high and low, the prior day's close, and
+  swing highs and lows: a bar whose high (low) is at or beyond every bar 30
+  minutes on each side.
+- **Zones.** Prices within 0.25 % of each other merge into one zone, shown as
+  its low to high with what made it ("high Thu 10-15, low Wed 10-14, 3
+  swings"). A zone needs 2 touches, or a session high, low or the prior
+  close, to count.
+- **Resistance** is a zone above the price, **support** one below. The price
+  is the trigger price once triggered, the last close before. Up to 3 each
+  side, nearest first.
+- **On a trigger** it also says the room to the next resistance (a target
+  past it has to get through it) and the nearest support, with the
+  `/trader-exit --stop price:X` that puts a stop a cent under it. That stop
+  is a suggestion; `/trader-exit` still decides, and an `sr` entry has no
+  opening-range default stop there, so give it one.
+- Levels are where price turned before, not a forecast. Say so.
+
 ## Steps
 
 1. Get the symbol from the user, or run `entry.py watchlist` after
    `/trader-scanner`. Check `/trader-news` for it first.
-2. Run `entry.py check SYMBOL`. Tell the user the status in one line:
+2. Run `entry.py check SYMBOL` (add `--levels` to see support and
+   resistance, or `--setup sr` to wait for a close above resistance instead
+   of the range high). Tell the user the status in one line:
    waiting and how far, triggered at what time and price, or expired.
 3. To wait for it, Claude can run `entry.py watch SYMBOL --until 15:30` in
    the background, or `entry.py check SYMBOL --write` on a `/loop` every 5
@@ -113,6 +147,20 @@ Next: set the stop and target BEFORE you buy: /trader-exit (exit.py plan --from 
 
 With `--min-volume-x 1` the 10:10 bar is too thin (0.60x the range's volume)
 and the trigger moves to 10:35 AM at 365.75 (the 10:30 bar, 7.98x).
+
+Support and resistance, the same day (`--setup sr`, the 60-day fixture so
+the prior sessions are in it). The range high $362.18 sits under a
+resistance zone, $363.69 to $364.34 (Thursday's high, Wednesday's low and 3
+swings). The orb trigger at $364.18 closed inside it, so `sr` waits:
+
+```
+Resistance to beat: $363.69-$364.34 (high Thu 10-15, low Wed 10-14, 3 swings); it needs a close above $364.34.
+TRIGGERED 10:20 AM at $365.05: the 10:15 bar (bar 9) closed above resistance $364.34 (+0.19%).
+  Resistance: $370.58-$371.39 (high Fri 10-16, low Tue 10-13, high Wed 10-14); ...
+  Support:    $363.69-$364.34 (high Thu 10-15, low Wed 10-14, 3 swings); $359.10-$359.80 (2 swings); ...
+  Room to the next resistance: $5.53 (+1.51%). A target past it has to get through it.
+  Nearest support $363.69: a stop under it is /trader-exit --stop price:363.68 (your call).
+```
 
 ## Rules
 
