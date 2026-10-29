@@ -37,6 +37,7 @@ python3 "${CLAUDE_SKILL_DIR}/kucoin.py" plan --write           # stop, target, s
 python3 "${CLAUDE_SKILL_DIR}/kucoin.py" order --yes "ja" --dry-run
 python3 "${CLAUDE_SKILL_DIR}/kucoin.py" order --yes "ja"       # entry, stop-loss, take-profit
 python3 "${CLAUDE_SKILL_DIR}/kucoin.py" close SOL --plan --wait  # the time stop
+python3 "${CLAUDE_SKILL_DIR}/kucoin.py" report --days 7        # the week: P/L, win rate, what worked
 python3 "${CLAUDE_SKILL_DIR}/kucoin.py" account                # equity and open positions
 ```
 
@@ -130,6 +131,24 @@ KuCoin Futures). Stocks, metals and commodities too: `TSLA`, `MU`, `XAUT`
 
 `--dry-run` prints the exact requests and sends nothing. Use it the first
 time, and whenever something looks off.
+
+## The weekly report
+
+`kucoin.py report --days 7` reads the closed positions straight from KuCoin
+(`/api/v1/history-positions`), so the results survive any session. Each one
+is matched to its ticket in `trader/kucoin-log.json` (same contract, opened
+within 3 minutes of the send) for its planned max loss, its R and how it
+ended: stop-loss, target, time stop, or liquidated. It prints the trades, the
+win rate, the net after fees and funding, average win and loss, profit
+factor, per-trade result in USDT and R, the deepest drawdown, and the split
+by exit, side and contract, then one verdict. Under about 30 trades it says
+the sample is too small to judge, and it means it: a week of results is
+mostly luck. Change one rule at a time, never after one bad day.
+
+The log lives in this session's `trader/` folder, which a cloud session does
+not keep. Copy it somewhere lasting after each trade (the user's private
+journal, never a public repository); without it the report still has every
+KuCoin number, only not the planned R or the exit reason.
 
 ## Rules
 

@@ -355,6 +355,79 @@ class Private(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
+def history(items):
+    return {"code": "200000", "data": {"currentPage": 1, "pageSize": 200, "totalNum": len(items), "totalPage": 1,
+                                       "items": items}}
+
+
+def pos(sym, kind, opened, minutes, op, cp, pnl, fee=0.1, funding=0.0):
+    o = ku.ms_of(opened)
+    return {"symbol": sym, "type": kind, "openTime": o, "closeTime": o + minutes * 60000, "openPrice": op,
+            "closePrice": cp, "pnl": pnl, "tradeFee": fee, "fundingFee": funding, "leverage": 1}
+
+
+class Report(unittest.TestCase):
+    """SYNTHETIC closed positions in KuCoin's history-positions shape."""
+    now = DT(2026, 11, 5, 20, 0)
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        d = DT(2026, 11, 2, 14, 0)
+        items = [pos("SOLUSDTM", "CLOSE_LONG", d, 6, 100.8, 100.25, -3.9),
+                 pos("SOLUSDTM", "CLOSE_LONG", d + datetime.timedelta(days=1), 12, 100.8, 101.625, 5.6),
+                 pos("XBTUSDTM", "CLOSE_SHORT", d + datetime.timedelta(days=2), 30, 81200, 81100, 1.1, funding=-0.02),
+                 pos("ETHUSDTM", "CLOSE_SHORT", d - datetime.timedelta(days=9), 30, 3000, 2990, 2.0)]   # outside the week
+        with open(os.path.join(self.tmp, "history-positions.json"), "w") as fh:
+            json.dump(history(items), fh)
+        journal = {"trades": [
+            {"id": "t1", "symbol": "SOLUSDTM", "sent_at": "2026-11-02T14:00:20Z", "entry": 100.8, "stop": 100.25,
+             "target": 101.625, "max_loss": 3.95},
+            {"id": "t2", "symbol": "SOLUSDTM", "sent_at": "2026-11-03T14:00:10Z", "entry": 100.8, "stop": 100.25,
+             "target": 101.625, "max_loss": 3.95},
+            {"id": "t3", "symbol": "XBTUSDTM", "sent_at": "2026-11-04T14:01:00Z", "entry": 81200, "stop": 81524.8,
+             "target": 80712.8, "max_loss": 1.27}]}
+        self.log = os.path.join(self.tmp, "log.json")
+        with open(self.log, "w") as fh:
+            json.dump(journal, fh)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_week(self):
+        items = ku.closed_positions(ku.Fetcher(self.tmp), self.now - datetime.timedelta(days=7), self.now)
+        self.assertEqual(len(items), 3)
+        with open(self.log) as fh:
+            rows = ku.trade_rows(items, json.load(fh)["trades"])
+        self.assertEqual([t["exit"] for t in rows], ["stop-loss", "target", "time stop"])
+        self.assertEqual([t["side"] for t in rows], ["long", "long", "short"])
+        self.assertEqual(rows[1]["r"], 1.42)
+        s = ku.stats(rows)
+        self.assertEqual((s["trades"], s["wins"], s["losses"], s["net"]), (3, 2, 1, 2.8))
+        self.assertEqual(s["profit_factor"], 1.72)
+        self.assertEqual(s["max_drawdown"], -3.9)
+        self.assertIn("too few to judge", ku.verdict(s, ku.DEFAULTS))
+        self.assertIn("made money", ku.verdict(s, ku.DEFAULTS))
+
+    def test_unmatched_and_losing(self):
+        rows = ku.trade_rows([pos("SOLUSDTM", "LIQUID_LONG", DT(2026, 11, 3), 3, 100, 60, -9.0)], [])
+        self.assertEqual((rows[0]["exit"], rows[0]["r"]), ("liquidated", None))
+        s = ku.stats(rows)
+        self.assertIn("lost money", ku.verdict(s, ku.DEFAULTS))
+        self.assertIn("filling past their price", ku.verdict(s, ku.DEFAULTS))
+        self.assertIn("nothing to judge", ku.verdict(ku.stats([]), ku.DEFAULTS))
+
+    def test_cli(self):
+        out = os.path.join(self.tmp, "report.json")
+        code, text, err = run(["report", "--offline", self.tmp, "--log", self.log, "--now", "2026-11-05 20:00",
+                               "--config", os.path.join(self.tmp, "none.json"), "--write", out])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Trades 3: 2 won, 1 lost", text)
+        self.assertIn("By exit:", text)
+        self.assertIn("Not financial advice", text)
+        with open(out) as fh:
+            self.assertEqual(json.load(fh)["stats"]["net"], 2.8)
+
+
 class SkillDoc(unittest.TestCase):
     def test_skill_md(self):
         with open(os.path.join(ROOT, "trader-kucoin", "SKILL.md"), encoding="utf-8") as fh:
