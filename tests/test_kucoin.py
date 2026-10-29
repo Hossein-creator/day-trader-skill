@@ -428,6 +428,55 @@ class Report(unittest.TestCase):
             self.assertEqual(json.load(fh)["stats"]["net"], 2.8)
 
 
+class Manual(unittest.TestCase):
+    """Option A: Claude plans, the user places the order in the app and reports the result."""
+
+    def test_plan_placed_result_report(self):
+        tmp = tempfile.mkdtemp()
+        saved = {k: os.environ.pop(k, None) for k in ("KUCOIN_API_KEY", "KUCOIN_API_SECRET", "KUCOIN_API_PASSPHRASE")}
+        try:
+            j = lambda n: os.path.join(tmp, n)
+            cfg = ["--config", j("kucoin.json")]
+            with open(j("entry.json"), "w") as fh:
+                json.dump({"symbol": "SOLUSDTM", "side": "long", "price": 102.3, "status": "triggered",
+                           "time": "2026-10-29T14:49:00Z", "range": {"high": 102.197, "low": 100.939, "mid": 101.568}}, fh)
+            plan = ["plan", "--offline", KDIR, "--from", j("entry.json"), "--write", j("plan.json"),
+                    "--log", j("log.json"), "--now", "2026-10-29 14:49"] + cfg
+            code, _, err = run(plan)
+            self.assertEqual(code, 1)
+            self.assertIn("no account balance for the 1 % rule", err)
+            with open(j("kucoin.json"), "w") as fh:
+                json.dump({"equity_usdt": 78.8}, fh)
+            code, text, err = run(plan)
+            self.assertEqual(code, 0, err)
+            self.assertIn("In the KuCoin app: Futures > SOLUSDT Perpetual.", text)
+            self.assertIn("Isolated, leverage 1x", text)
+            self.assertIn("take-profit 103.398, stop-loss 101.568", text)
+            with open(j("plan.json")) as fh:
+                p = json.load(fh)
+            self.assertLessEqual(p["max_loss"], 0.788)                 # 1 % of 78.80
+            self.assertEqual(p["decided_by"], "position cap 50 % of equity")   # at 1x the 39.40 USDT cap binds first
+            self.assertLessEqual(p["notional_usdt"], 39.4)
+            code, text, err = run(["placed", "--plan", j("plan.json"), "--log", j("log.json"), "--fill", "102.31",
+                                   "--now", "2026-10-29 14:50"] + cfg)
+            self.assertEqual(code, 0, err)
+            self.assertIn("Time stop at 15:20 UTC (16:20 Berlin)", text)
+            self.assertEqual(run(["placed", "--plan", j("plan.json"), "--log", j("log.json")] + cfg)[0], 1)
+            code, text, err = run(["result", "SOL", "--exit", "103.398", "--log", j("log.json"), "--now", "2026-10-29 15:02"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("(target)", text)
+            code, text, err = run(["report", "--log", j("log.json"), "--now", "2026-10-30 12:00"] + cfg)
+            self.assertEqual(code, 0, err)
+            self.assertIn("from the journal", text)
+            self.assertIn("Trades 1: 1 won, 0 lost", text)
+            self.assertIn("target", text)
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+            shutil.rmtree(tmp)
+
+
 class SkillDoc(unittest.TestCase):
     def test_skill_md(self):
         with open(os.path.join(ROOT, "trader-kucoin", "SKILL.md"), encoding="utf-8") as fh:

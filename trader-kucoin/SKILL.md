@@ -39,6 +39,8 @@ python3 "${CLAUDE_SKILL_DIR}/kucoin.py" order --yes "ja"       # entry, stop-los
 python3 "${CLAUDE_SKILL_DIR}/kucoin.py" close SOL --plan --wait  # the time stop
 python3 "${CLAUDE_SKILL_DIR}/kucoin.py" report --days 7        # the week: P/L, win rate, what worked
 python3 "${CLAUDE_SKILL_DIR}/kucoin.py" account                # equity and open positions
+python3 "${CLAUDE_SKILL_DIR}/kucoin.py" placed --fill 102.31   # by hand: the user placed the ticket in the app
+python3 "${CLAUDE_SKILL_DIR}/kucoin.py" result SOL --exit 103.40 --pnl 0.31   # by hand: how it ended
 ```
 
 Symbols: `BTC`, `SOL`, `ETH-USDT` or `XBTUSDTM` all work (BTC is `XBT` on
@@ -131,6 +133,30 @@ KuCoin Futures). Stocks, metals and commodities too: `TSLA`, `MU`, `XAUT`
 
 `--dry-run` prints the exact requests and sends nothing. Use it the first
 time, and whenever something looks off.
+
+## By hand: when KuCoin refuses the account API
+
+KuCoin refuses every account call (balance, positions, orders) from regions
+it does not serve, and a Claude cloud session runs in the US, so from there
+the user places the order in the app. Never route around the block (a VPN or
+a proxy breaks KuCoin's terms and risks the account). The public data still
+works, so the brief, the news, the setup and the plan stay the same:
+
+1. The balance for the 1 % rule: `"equity_usdt"` in `trader/kucoin.json`, or
+   `plan --equity USDT`. Ask the user for the futures balance shown in the
+   app, and update it when it changes. A plan without one is refused.
+2. `plan --write` prints the ticket and the taps in the app: Futures, the
+   pair, Isolated 1x, Market, the size, TP/SL on the last price, Buy/Long or
+   Sell/Short, and an alarm for the time stop.
+3. When the user says it is in: `placed --fill PRICE` logs it, so the daily
+   limits count it, and prints the time stop. Remind the user at that time
+   (a scheduled check-in, when the session has one) to close what is left.
+4. When it is closed: `result SYMBOL --exit PRICE --pnl USDT` with the
+   realised P/L from the app (without `--pnl` it is computed from the prices
+   with the taker fee). The exit reason comes from the price, or `--why`.
+5. `report` then reads the journal (`--source journal`; `auto` falls back to
+   it when KuCoin refuses). Keep the log somewhere lasting: the user's private
+   journal, never a public repository.
 
 ## The weekly report
 

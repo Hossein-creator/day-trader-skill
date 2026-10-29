@@ -82,6 +82,7 @@ DEFAULTS = {
     "min_turnover_usdt": 20000000.0,  # 24-hour turnover a crypto contract needs to make the brief
     "min_turnover_other_usdt": 3000000.0,  # the same for stocks, metals and commodities
     "plan_max_age_minutes": 3,        # an order from an older plan is refused: re-plan
+    "equity_usdt": None,              # the futures account's balance, for the 1 % rule when KuCoin cannot be asked
 }
 SWING_BARS = 6      # 5-minute bars on each side of a swing (30 minutes)
 ZONE_PCT = 0.2
@@ -888,13 +889,39 @@ def cmd_watch(a):
             time.sleep(wait)
 
 
-def equity_or_none(a):
+def equity_of(a, cfg):
+    """The futures equity for the 1 % rule: --equity, else the config, else KuCoin.
+    KuCoin refuses account calls from some regions (a US cloud session among them),
+    so a plan without any of them is refused rather than sized without the rule."""
     if a.equity is not None:
         return float(a.equity)
-    if a.offline or not os.environ.get("KUCOIN_API_KEY"):
-        return None
-    acct = private("GET", "/api/v1/account-overview?currency=USDT") or {}
-    return float(acct.get("accountEquity") or 0) or None
+    if cfg.get("equity_usdt"):
+        return float(cfg["equity_usdt"])
+    if not a.offline and os.environ.get("KUCOIN_API_KEY"):
+        try:
+            acct = private("GET", "/api/v1/account-overview?currency=USDT") or {}
+            if float(acct.get("accountEquity") or 0) > 0:
+                return float(acct["accountEquity"])
+        except KuError as e:
+            print("KuCoin did not give the balance (%s)." % str(e)[:160], file=sys.stderr)
+    raise KuError("no account balance for the 1 %% rule: give --equity USDT (the futures balance in the app) "
+                  "or set \"equity_usdt\" in %s" % a.config)
+
+
+def app_steps(p):
+    """The ticket as taps in the KuCoin app, for a trade the user places by hand."""
+    t = p["tick"]
+    pair = p["symbol"][:-1] if p["symbol"].endswith("USDTM") else p["symbol"]
+    pair = ("BTC" + pair[3:]) if pair.startswith("XBT") else pair
+    return ["In the KuCoin app: Futures > %s Perpetual." % pair,
+            "  1. Margin mode Isolated, leverage 1x.",
+            "  2. Order type Market. Size %d contract%s (= %s %s; the app may show either)." % (
+                p["lots"], "s" if p["lots"] > 1 else "", p["size_units"], p["base"]),
+            "  3. Tick TP/SL: take-profit %s, stop-loss %s, trigger on the last price." % (
+                fmt(p["target"], t), fmt(p["stop"], t)),
+            "  4. %s, check the summary, confirm." % ("Buy/Long" if p["side"] == "long" else "Sell/Short"),
+            "  5. Set an alarm for %s: close whatever is left at market (the time stop)." % stamp(parse_now(p["close_by"])),
+            "Then say it is in, with the fill price: kucoin.py placed --fill PRICE."]
 
 
 def cmd_plan(a):
@@ -912,15 +939,62 @@ def cmd_plan(a):
     if entry.get("status") != "triggered" and a.entry is None:
         raise KuError("%s is %s, not triggered: plan once it triggers, or give --entry" % (entry.get("symbol"), entry.get("status")))
     c = contract(f, entry["symbol"])
-    p = build_plan(c, entry, cfg, now, equity_or_none(a), read_json(a.log, {}), a.stop, a.target)
+    p = build_plan(c, entry, cfg, now, equity_of(a, cfg), read_json(a.log, {}), a.stop, a.target)
     if a.write:
         write_json(a.write, p)
     if a.json:
         print(json.dumps(p, indent=2))
     else:
         print("\n".join(ticket(p)))
-        print("Wrote %s. To send it the user types yes for this ticket, then: kucoin.py order --yes \"<their words>\"."
-              % a.write if a.write else "Not saved: add --write to keep it.")
+        print("\n".join(app_steps(p)))
+        print("Wrote %s." % a.write if a.write else "Not saved: add --write to keep it.")
+    return 0
+
+
+def cmd_placed(a):
+    """The user placed the ticket by hand: put it in the log so the daily limits count it."""
+    p = read_json(a.plan)
+    if not p:
+        raise KuError("no plan at %s: run kucoin.py plan --write" % a.plan)
+    now = parse_now(a.now)
+    log = read_json(a.log, {"trades": []}) or {"trades": []}
+    if any(x.get("id") == p["id"] for x in log["trades"]):
+        raise KuError("ticket %s is already in the log" % p["id"])
+    fill = float(a.fill) if a.fill is not None else p["entry"]
+    log["trades"].append({"id": p["id"], "date": now.strftime("%Y-%m-%d"), "symbol": p["symbol"], "side": p["side"],
+                          "lots": p["lots"], "multiplier": p["multiplier"], "max_loss": p["max_loss"],
+                          "close_by": (now + datetime.timedelta(minutes=int(read_config(a.config)["hold_minutes"])))
+                          .strftime("%Y-%m-%dT%H:%M:%SZ"), "sent_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                          "entry": fill, "planned_entry": p["entry"], "stop": p["stop"], "target": p["target"],
+                          "r_multiple": p["r_multiple"], "manual": True})
+    write_json(a.log, log)
+    rec = log["trades"][-1]
+    print("Logged %s %s %s at %s. Time stop at %s." % (p["id"], p["side"], p["symbol"], fmt(fill, p["tick"]),
+                                                       stamp(parse_now(rec["close_by"]))))
+    return 0
+
+
+def cmd_result(a):
+    """How a hand-placed trade ended: the exit price, and the P/L if the app shows it."""
+    now = parse_now(a.now)
+    log = read_json(a.log, {"trades": []}) or {"trades": []}
+    sym = symbol_of(a.ticket) if not a.ticket.startswith("dts-") else None
+    open_ = [x for x in log["trades"] if not x.get("result") and (x.get("id") == a.ticket or x.get("symbol") == sym)]
+    if not open_:
+        raise KuError("no open ticket %s in %s" % (a.ticket, a.log))
+    rec = open_[-1]
+    sign = 1 if rec["side"] == "long" else -1
+    units = rec["lots"] * float(rec.get("multiplier") or 0)
+    fee = float(a.fee_rate) * units * (rec["entry"] + a.exit)
+    pnl = float(a.pnl) if a.pnl is not None else sign * (a.exit - rec["entry"]) * units - fee
+    tol = abs(rec["entry"] - rec["stop"]) * 0.25
+    why = a.why or ("stop-loss" if abs(a.exit - rec["stop"]) <= tol else
+                    "target" if abs(a.exit - rec["target"]) <= tol else "time stop")
+    rec["result"] = {"exit": a.exit, "pnl": r(pnl, 4), "fees": r(fee, 4) if a.pnl is None else None, "why": why,
+                     "closed_at": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    write_json(a.log, log)
+    print("%s %s closed at %s (%s): %+.2f USDT%s." % (rec["symbol"], rec["side"], a.exit, why, pnl,
+                                                      ", %+.2fR" % (pnl / rec["max_loss"]) if rec.get("max_loss") else ""))
     return 0
 
 
@@ -1097,6 +1171,26 @@ def trade_rows(items, journal, hold_minutes=30):
     return rows
 
 
+def journal_rows(journal, start, end):
+    """Trades with a recorded result, in the shape trade_rows gives."""
+    rows = []
+    for rec in journal:
+        res = rec.get("result")
+        if not res:
+            continue
+        closed, opened = parse_now(res["closed_at"]), parse_now(rec["sent_at"])
+        if not (start <= closed < end):
+            continue
+        rows.append({"symbol": rec["symbol"], "side": rec["side"], "opened": opened.strftime("%Y-%m-%d %H:%M"),
+                     "closed": closed.strftime("%Y-%m-%d %H:%M"), "minutes": int((closed - opened).total_seconds() // 60),
+                     "open_price": rec["entry"], "close_price": res["exit"], "pnl": float(res["pnl"]),
+                     "fees": float(res.get("fees") or 0), "funding": 0.0, "max_loss": rec.get("max_loss"),
+                     "r": r(float(res["pnl"]) / rec["max_loss"]) if rec.get("max_loss") else None,
+                     "exit": res.get("why") or "closed", "ticket": rec.get("id")})
+    rows.sort(key=lambda t: t["closed"])
+    return rows
+
+
 def stats(rows):
     n = len(rows)
     wins = [t["pnl"] for t in rows if t["pnl"] > 0]
@@ -1146,7 +1240,19 @@ def cmd_report(a):
     end = parse_now(a.now)
     start = end - datetime.timedelta(days=a.days)
     journal = (read_json(a.log, {"trades": []}) or {}).get("trades", [])
-    rows = trade_rows(closed_positions(_fetcher(a), start, end), journal, int(cfg["hold_minutes"]))
+    source = a.source
+    if source == "auto":
+        source = "kucoin" if (a.offline or os.environ.get("KUCOIN_API_KEY")) else "journal"
+    if source == "kucoin":
+        try:
+            rows = trade_rows(closed_positions(_fetcher(a), start, end), journal, int(cfg["hold_minutes"]))
+        except KuError as e:
+            if a.source == "kucoin":
+                raise
+            print("KuCoin did not give the closed positions (%s): using the journal." % str(e)[:120], file=sys.stderr)
+            source = "journal"
+    if source == "journal":
+        rows = journal_rows(journal, start, end)
     s = stats(rows)
     doc = {"created_by": "trader-kucoin", "from": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "to": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
            "stats": s, "by_symbol": groups(rows, "symbol"), "by_side": groups(rows, "side"),
@@ -1156,8 +1262,9 @@ def cmd_report(a):
     if a.json:
         print(json.dumps(doc, indent=2))
         return 0
-    print("KuCoin Futures report %s to %s UTC (%d days), from KuCoin's closed positions." % (
-        start.strftime("%Y-%m-%d %H:%M"), end.strftime("%Y-%m-%d %H:%M"), a.days))
+    print("KuCoin Futures report %s to %s UTC (%d days), from %s." % (
+        start.strftime("%Y-%m-%d %H:%M"), end.strftime("%Y-%m-%d %H:%M"), a.days,
+        "KuCoin's closed positions" if source == "kucoin" else "the journal (results as recorded)"))
     if not rows:
         print(doc["verdict"])
         return 0
@@ -1251,8 +1358,22 @@ def main(argv=None):
     p.add_argument("--wait", action="store_true", help="with --plan: wait until its close-by time first")
     p.add_argument("--yes")
     p.add_argument("--log", default="trader/kucoin-log.json")
+    p = sub.add_parser("placed", help="log a ticket the user placed by hand in the app")
+    common(p)
+    p.add_argument("--plan", default="trader/kucoin-plan.json")
+    p.add_argument("--log", default="trader/kucoin-log.json")
+    p.add_argument("--fill", type=float, help="the fill price the app shows (default: the plan's entry)")
+    p = sub.add_parser("result", help="record how a hand-placed trade ended")
+    p.add_argument("ticket", help="the ticket id (dts-...) or the symbol")
+    p.add_argument("--exit", type=float, required=True, help="the exit price")
+    p.add_argument("--pnl", type=float, help="the realised P/L in USDT the app shows (else computed)")
+    p.add_argument("--why", choices=["stop-loss", "target", "time stop", "by hand"])
+    p.add_argument("--fee-rate", type=float, default=0.0006, help="taker fee for the computed P/L")
+    p.add_argument("--log", default="trader/kucoin-log.json")
+    p.add_argument("--now")
     p = sub.add_parser("report", help="the last N days of closed trades: P/L, win rate, what worked")
     common(p)
+    p.add_argument("--source", choices=["auto", "kucoin", "journal"], default="auto")
     p.add_argument("--days", type=int, default=7)
     p.add_argument("--log", default="trader/kucoin-log.json")
     p.add_argument("--write", nargs="?", const="trader/kucoin-report.json", metavar="PATH")
@@ -1265,6 +1386,7 @@ def main(argv=None):
     try:
         return {"brief": cmd_brief, "news": cmd_news, "levels": cmd_levels, "check": cmd_check, "watch": cmd_watch,
                 "plan": cmd_plan, "order": cmd_order, "close": cmd_close, "report": cmd_report,
+                "placed": cmd_placed, "result": cmd_result,
                 "account": cmd_account}[a.cmd](a)
     except KuError as e:
         print("kucoin.py: %s" % e, file=sys.stderr)
