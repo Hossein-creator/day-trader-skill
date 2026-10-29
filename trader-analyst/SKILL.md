@@ -120,4 +120,5 @@ so the summary read that 10-Q directly.
 
 Education and tooling, not financial advice. This skill only reads filings.
 Nothing places an order except `/trader-broker`, after `/trader-risk` passes
-and the user types an explicit yes for that order.
+and the user types an explicit yes for that order, and `/trader-kucoin`, after
+its brief, news check and limits pass and the user types yes for that ticket.
