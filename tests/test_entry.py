@@ -585,6 +585,113 @@ class Cli(unittest.TestCase):
         self.assertIn("run /trader-scanner first", err)
 
 
+SIXTY = os.path.join(FIX, "trader-timemachine", "TSLA-60d5m.json.gz")   # the reel's 60 days, to 10:49:45 Oct 19
+
+
+class SupportResistance(unittest.TestCase):
+    """Zones from the four sessions before Oct 19 (Oct 13 to 16), in the 60-day fixture."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.chart = entry.get_chart("TSLA", "5m", offline=SIXTY)
+
+    def at(self, text, **kw):
+        return entry.evaluate(self.chart, ny("2026-10-19 " + text), **kw)
+
+    def test_zones_come_from_the_prior_sessions_only(self):
+        sr = entry.sr_zones(self.chart, datetime.date(2026, 10, 19), "5m", 4)
+        self.assertEqual(sr["sessions"], ["2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16"])
+        self.assertEqual(sr["prev_day"], {"date": "2026-10-16", "high": 370.58, "low": 349.33, "close": 354.67})
+        key = [z for z in sr["zones"] if z["low"] == 363.69][0]
+        self.assertEqual((key["high"], key["touches"]), (364.34, 5))
+        self.assertEqual(key["kinds"], ["high Thu 10-15", "low Wed 10-14", "3 swings"])
+        for z in sr["zones"]:
+            self.assertLessEqual(z["high"], z["low"] * (1 + entry.ZONE_PCT / 100.0) + 0.01)
+            self.assertTrue(z["touches"] >= 2 or not z["kinds"][0][0].isdigit())
+        # today's bars never make a zone: the same zones at 9:31 and at 10:45
+        self.assertEqual(self.at("09:31", sr_days=4)["_sr"], self.at("10:45", sr_days=4)["_sr"])
+
+    def test_sr_waits_through_the_zone_the_orb_trigger_closed_in(self):
+        r = self.at("10:15", setup="sr")
+        self.assertEqual(r["status"], "waiting")
+        self.assertEqual(r["level"], 364.34)
+        self.assertEqual(r["zone"]["low"], 363.69)
+        self.assertEqual(r["last"]["close"], 364.18)        # the orb trigger, inside the zone
+        self.assertEqual(r["levels"]["inside"]["low"], 363.69)
+        r = self.at("10:35", setup="sr")
+        self.assertEqual(r["status"], "triggered")
+        self.assertEqual((r["trigger"]["time"], r["trigger"]["price"], r["trigger"]["bar_index"]), ("10:20 AM", 365.05, 9))
+        lv = r["levels"]
+        self.assertEqual(lv["price"], 365.05)
+        self.assertEqual(lv["resistance"][0]["low"], 370.58)
+        self.assertEqual(lv["support"][0]["low"], 363.69)
+        self.assertEqual((lv["room"], lv["room_pct"]), (5.53, 1.51))
+        text = "\n".join(entry.describe(r))
+        self.assertIn("closed above resistance $364.34", text)
+        self.assertIn("--stop price:363.68", text)
+        self.assertIn("not a forecast", text)
+
+    def test_orb_unchanged_and_levels_only_when_asked(self):
+        plain, more = self.at("10:15"), self.at("10:15", sr_days=4)
+        self.assertNotIn("levels", plain)
+        self.assertNotIn("Support/resistance", "\n".join(entry.describe(plain)))
+        self.assertEqual(plain["trigger"], more["trigger"])
+        self.assertEqual(more["trigger"]["price"], 364.18)
+        self.assertEqual(more["levels"]["inside"]["high"], 364.34)
+
+    def test_sr_needs_prior_sessions(self):
+        r = entry.evaluate(chart(), ny("2026-10-19 10:15"), setup="sr")   # the one-day fixture
+        self.assertEqual(r["status"], "no-data")
+        self.assertIn("no prior sessions", r["reason"])
+        r = entry.evaluate(chart(), ny("2026-10-19 10:15"), sr_days=4)
+        self.assertIsNone(r["levels"])
+        self.assertEqual(r["status"], "triggered")
+
+    def test_no_resistance_above_the_range(self):
+        r = self.at("10:15", setup="sr", sr_days=1)
+        z = [x["high"] for x in r["_sr"]["zones"]]
+        self.assertTrue(any(h > 362.18 for h in z))           # Friday's high is above the range
+        lifted = copy.deepcopy(self.chart)
+        lifted["bars"] = [dict(b, h=b["h"] + 50 if entry.to_eastern(entry.utc_of(b["t"])).date().day == 19 else b["h"])
+                          for b in lifted["bars"]]
+        r = entry.evaluate(lifted, ny("2026-10-19 10:15"), setup="sr")
+        self.assertEqual(r["status"], "no-data")
+        self.assertIn("no resistance above the range high", r["reason"])
+
+    def test_history_url_and_cli(self):
+        calls = []
+        old = entry._open_url
+        try:
+            entry._open_url = lambda url, timeout=20: calls.append(url) or read_gz(SIXTY)
+            entry.get_chart("TSLA", "5m", datetime.date(2026, 10, 19), today=datetime.date(2026, 10, 19), history=4)
+            entry.get_chart("TSLA", "5m", datetime.date(2026, 10, 19), today=datetime.date(2026, 10, 19), history=10)
+        finally:
+            entry._open_url = old
+        self.assertIn("range=5d&interval=5m", calls[0])
+        self.assertIn("range=1mo&interval=5m", calls[1])
+        tmp = tempfile.mkdtemp()
+        try:
+            out = os.path.join(tmp, "entry.json")
+            code, text, _ = run(["check", "TSLA", "--setup", "sr", "--offline", SIXTY, "--now", "2026-10-19 10:35",
+                                 "--config", os.path.join(tmp, "none.json"), "--write", out])
+            self.assertEqual(code, 0)
+            self.assertIn("TRIGGERED 10:20 AM at $365.05", text)
+            with open(out) as fh:
+                d = json.load(fh)
+            self.assertEqual((d["setup"], d["level"], d["price"]), ("sr", 364.34, 365.05))
+            self.assertEqual(d["levels"]["support"][0]["low"], 363.69)
+            code, _, err = run(["check", "TSLA", "--setup", "sr", "--level", "370", "--offline", SIXTY])
+            self.assertEqual(code, 1)
+            self.assertIn("--level is for --setup level", err)
+        finally:
+            shutil.rmtree(tmp)
+
+
+def read_gz(path):
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        return fh.read()
+
+
 class SkillDoc(unittest.TestCase):
     def test_skill_md(self):
         with open(os.path.join(ROOT, "trader-entry", "SKILL.md"), encoding="utf-8") as fh:

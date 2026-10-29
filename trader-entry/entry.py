@@ -16,9 +16,22 @@ Setups (v2 plans longs only):
          above the range high. A wick above the high is not a trigger.
   level  the first completed bar that closes above --level (for example a
          20-day high from trader-scanner).
+  sr     support/resistance breakout: the first completed bar after the
+         opening range that closes above the top of the nearest resistance
+         zone over the range high. The zones come from the --sr-days prior
+         sessions only (default 4, what Yahoo's 5-day chart holds), so they
+         are fixed before the open and never move during the day.
   --min-volume-x X  the trigger bar also needs at least X times the average
          volume of the opening-range bars (the 9:30 bar carries the opening
          auction, so 1.0 is already a high bar).
+  --levels  also show support and resistance for orb and level (sr always does).
+
+Support and resistance, from the prior sessions' regular-hours bars: each
+session's high and low, the prior day's close, and swing highs and lows (a
+bar's high or low beyond every bar 30 minutes on each side). Prices within 0.25 % of
+each other merge into one zone; a zone needs 2 touches or a session high,
+low or the prior close to count. Resistance is a zone above the price,
+support one below it. These are price facts, not a forecast.
 
 A trigger's time is the trigger bar's CLOSE time (the 10:10 bar closes at
 10:15 AM) and its price is that close, to the cent. Only bars on the interval
@@ -69,6 +82,10 @@ SETTLE = 60      # seconds a closed bar may wait for Yahoo's data to catch up
 HOSTS = ("query2", "query1")
 INTERVALS = {"1m": 60, "5m": 300}
 DEFAULTS = {"no_entries_before": "09:45", "no_entries_after": "15:30"}
+SR_DAYS = 4      # prior sessions for support/resistance: what Yahoo's range=5d holds besides today
+SWING_MIN = 30   # a swing high's high is >= every bar 30 minutes on each side (a swing low's low <=)
+ZONE_PCT = 0.25  # prices within 0.25 % of each other are one zone
+SR_SHOW = 3      # zones shown on each side of the price
 EPOCH = datetime.datetime(1970, 1, 1)
 
 NYSE_HOLIDAYS = {
@@ -351,8 +368,19 @@ def offline_file(path, sym):
     return path
 
 
-def get_chart(sym, interval, day=None, offline=None, today=None):
-    """Bars for one ticker, from Yahoo (range=1d for today) or a saved file."""
+def sessions_back(day, n):
+    """The date of the n-th trading session before `day` (n=0 is day itself)."""
+    d = day
+    for _ in range(n):
+        d -= datetime.timedelta(days=1)
+        while not session(d):
+            d -= datetime.timedelta(days=1)
+    return d
+
+
+def get_chart(sym, interval, day=None, offline=None, today=None, history=0):
+    """Bars for one ticker, from Yahoo (range=1d for today) or a saved file.
+    history=N also asks Yahoo for the N sessions before `day` (support/resistance)."""
     sym = sym.upper()
     if offline:
         f = offline_file(offline, sym)
@@ -362,7 +390,10 @@ def get_chart(sym, interval, day=None, offline=None, today=None):
             raise EntryError("could not read %s: %s" % (f, e))
     else:
         today = today or to_eastern(utc_now()).date()
-        text = yahoo_get(chart_path(sym, chart_range(day or today, today, interval), interval))
+        start = sessions_back(day or today, history) if history else (day or today)
+        if history and interval == "1m" and (today - start).days > 6:
+            raise EntryError("Yahoo keeps 1-minute bars for about a week: use --sr-days 4 or less, or --interval 5m")
+        text = yahoo_get(chart_path(sym, chart_range(start, today, interval), interval))
     ch = parse_chart(text, sym)
     if ch["symbol"] != yahoo_symbol(sym):
         raise EntryError("the chart file holds %s, not %s" % (ch["symbol"], sym))
@@ -405,17 +436,107 @@ def early_cutoff(day, t, close_dt):
     return moved if moved.time() > OPEN else close_dt
 
 
+def sr_zones(chart, day, interval, sr_days=SR_DAYS):
+    """Support/resistance zones from the sr_days regular sessions before `day`.
+    Only prior sessions count, so the zones are known before the open and do not move.
+    -> {"sessions": [dates], "prev_day": {...}, "zones": [{low, high, mid, touches, kinds}]} or None."""
+    step = INTERVALS[interval]
+    k = SWING_MIN * 60 // step
+    by_day = {}
+    for b in chart["bars"]:
+        if b["t"] % step:
+            continue
+        et = to_eastern(utc_of(b["t"]))
+        s = session(et.date())
+        if et.date() >= day or not s or not (s[0] <= et.time() < s[1]):
+            continue
+        by_day.setdefault(et.date(), []).append(b)
+    days = sorted(by_day)[-sr_days:]
+    if not days:
+        return None
+    cands = []    # (price, kind)
+    for d in days:
+        bs = sorted(by_day[d], key=lambda b: b["t"])
+        cands.append((max(b["h"] for b in bs), "high %s" % d.strftime("%a %m-%d")))
+        cands.append((min(b["l"] for b in bs), "low %s" % d.strftime("%a %m-%d")))
+        for i in range(k, len(bs) - k):
+            near = bs[i - k:i] + bs[i + 1:i + 1 + k]
+            if bs[i]["h"] >= max(x["h"] for x in near):
+                cands.append((bs[i]["h"], "swing high"))
+            if bs[i]["l"] <= min(x["l"] for x in near):
+                cands.append((bs[i]["l"], "swing low"))
+    last = sorted(by_day[days[-1]], key=lambda b: b["t"])
+    cands.append((last[-1]["c"], "prior close"))
+    zones, cur = [], []
+    for p, kind in sorted(cands):
+        if cur and p > cur[0][0] * (1 + ZONE_PCT / 100.0):
+            zones.append(cur)
+            cur = []
+        cur.append((p, kind))
+    if cur:
+        zones.append(cur)
+    out = []
+    for z in zones:
+        named = [k for _, k in z if k != "swing high" and k != "swing low"]
+        if len(z) < 2 and not named:
+            continue
+        swings = len(z) - len(named)
+        kinds = named + (["%d swing%s" % (swings, "s" if swings > 1 else "")] if swings else [])
+        lo, hi = min(p for p, _ in z), max(p for p, _ in z)
+        out.append({"low": r2(lo), "high": r2(hi), "mid": r2(sum(p for p, _ in z) / len(z)),
+                    "touches": len(z), "kinds": kinds})
+    return {"sessions": [d.isoformat() for d in days],
+            "prev_day": {"date": days[-1].isoformat(), "high": r2(max(b["h"] for b in last)),
+                         "low": r2(min(b["l"] for b in last)), "close": r2(last[-1]["c"])},
+            "zones": out}
+
+
+def split_zones(sr, price):
+    """(resistance above price nearest first, support below nearest first, zone holding price)."""
+    zs = sr["zones"] if sr else []
+    res = [z for z in zs if z["low"] > price]
+    sup = [z for z in reversed(zs) if z["high"] < price]
+    inside = next((z for z in zs if z["low"] <= price <= z["high"]), None)
+    return res[:SR_SHOW], sup[:SR_SHOW], inside
+
+
 def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=None,
-             min_volume_x=None, cfg=None):
-    """Pure function: the setup's status at now_utc from one session's bars."""
+             min_volume_x=None, cfg=None, sr_days=None):
+    """Pure function: the setup's status at now_utc from one session's bars.
+    sr_days (or setup sr) also reads support/resistance from the sessions before."""
+    return with_levels(_evaluate(chart, now_utc, setup, or_minutes, interval, level, min_volume_x, cfg, sr_days))
+
+
+def with_levels(res):
+    """Add res["levels"]: the zones split around the trigger price, else the last close."""
+    sr = res.get("_sr")
+    if not sr:
+        if res.get("sr_days"):
+            res["levels"] = None
+        return res
+    t, last, orr = res.get("trigger"), res.get("last"), res.get("opening_range")
+    ref = (t and t["price"]) or (last and last["close"]) or (orr and orr["high"]) or sr["prev_day"]["close"]
+    above, below, inside = split_zones(sr, ref)
+    lv = {"sessions": sr["sessions"], "prev_day": sr["prev_day"], "price": ref,
+          "resistance": above, "support": below, "inside": inside}
+    if t and above:
+        lv["room"] = r2(above[0]["low"] - ref)
+        lv["room_pct"] = r2(100.0 * (above[0]["low"] / ref - 1))
+    res["levels"] = lv
+    return res
+
+
+def _evaluate(chart, now_utc, setup, or_minutes, interval, level, min_volume_x, cfg, sr_days):
     cfg = cfg or dict(DEFAULTS)
     if interval not in INTERVALS:
         raise EntryError("--interval is 5m or 1m")
     step = INTERVALS[interval]
     if or_minutes <= 0 or (or_minutes * 60) % step:
         raise EntryError("--or-minutes must be a whole number of %s bars" % interval)
-    if setup not in ("orb", "level"):
-        raise EntryError("--setup is orb or level")
+    if setup not in ("orb", "level", "sr"):
+        raise EntryError("--setup is orb, level or sr")
+    if setup == "sr" and not sr_days:
+        sr_days = SR_DAYS
     if setup == "level" and level is None:
         raise EntryError("--setup level needs --level PRICE (for example a 20-day high)")
     n_or = or_minutes * 60 // step
@@ -442,6 +563,9 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     or_end = open_dt + datetime.timedelta(minutes=or_minutes)
     res.update(opens=hm(o), closes=hm(c), early_close=NYSE_EARLY_CLOSE.get(day.isoformat()),
                no_entries_before=hm(before), no_entries_after=hm(cutoff))
+    sr = sr_zones(chart, day, interval, sr_days) if sr_days else None
+    res["_sr"] = sr
+    res["sr_days"] = sr_days
 
     by_slot = {}
     for b in chart["bars"]:
@@ -476,7 +600,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
 
     if local < open_dt:
         res.update(phase="pre-open", reason="the NYSE opens at 9:30%s" % (
-            " and the %d-minute range is set at %s" % (or_minutes, short(or_end)) if setup == "orb" else ""))
+            " and the %d-minute range is set at %s" % (or_minutes, short(or_end)) if setup in ("orb", "sr") else ""))
         return res
 
     or_bars = [b for b in bars if b["slot"] < n_or]
@@ -485,7 +609,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         res["opening_range"] = {"high": r2(max(b["h"] for b in or_bars)), "low": r2(min(b["l"] for b in or_bars)),
                                 "minutes": or_minutes, "bars": len(or_bars), "of": n_or,
                                 "complete": local >= or_end, "avg_volume": int(round(avg_vol))}
-    if setup == "orb":
+    if setup in ("orb", "sr"):
         if local < or_end:
             res.update(phase="forming", reason="%d of %d range bars closed; the range is set at %s" % (
                 len(or_bars), n_or, short(or_end)))
@@ -494,11 +618,24 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             res.update(status="no-data", phase="open", reason="Yahoo sent no bars for the opening range")
             return res
         lvl = max(b["h"] for b in or_bars)
+        if setup == "sr":
+            if not sr or not sr["zones"]:
+                res.update(status="no-data", phase="open",
+                           reason="no prior sessions in the data for support/resistance (Yahoo range=5d or longer)")
+                return res
+            zone = next((z for z in sr["zones"] if z["high"] > r2(lvl)), None)
+            if not zone:
+                res.update(status="no-data", phase="open",
+                           reason="no resistance above the range high $%.2f in the last %d sessions: "
+                                  "the price is over all of it, use --setup orb" % (lvl, len(sr["sessions"])))
+                return res
+            res["zone"] = zone
+            lvl = zone["high"]
     else:
         lvl = float(level)
     res["level"] = r2(lvl)
 
-    first_slot = n_or if setup == "orb" else 0
+    first_slot = n_or if setup in ("orb", "sr") else 0
     trig, thin = None, []
     for b in bars:
         if b["slot"] < first_slot or b["end"] < before or b["end"] > cutoff:
@@ -518,7 +655,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     if trig:
         vx = (trig["v"] / avg_vol) if avg_vol else None
         res.update(status="triggered", phase="open" if local < close_dt else "after-close",
-                   reason="the %s bar closed above %s" % (short(trig["et"]), "the range high" if setup == "orb" else "the level"))
+                   reason="the %s bar closed above %s" % (short(trig["et"]), level_word(setup)))
         res["trigger"] = {"time": ampm(trig["end"]), "close_time": hm(trig["end"]), "bar_start": hm(trig["et"]),
                           "bar_index": trig["slot"], "price": r2(trig["c"]), "close": trig["c"],
                           "volume": trig["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (trig["c"] / lvl - 1))}
@@ -530,7 +667,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     if not bars:
         res.update(status="no-data", phase="open", reason="Yahoo sent no bars for %s yet" % day.isoformat())
         return res
-    what = "close above the range high $%.2f" % lvl if setup == "orb" else "close above $%.2f" % lvl
+    what = "close above %s $%.2f" % (level_word(setup), lvl) if setup != "level" else "close above $%.2f" % lvl
     if local >= cutoff and not (pending and pending["end"] <= cutoff):
         res.update(status="expired", phase="after-close" if local >= close_dt else "after-cutoff",
                    reason="no %s by %s, the last time for a new entry%s" % (
@@ -547,9 +684,13 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         gap = lvl - last["c"]
         res["reason"] = "last close $%.2f (%s bar), $%.2f %s %s (%+.2f%%)" % (
             last["c"], short(last["et"]), abs(gap), "under" if gap >= 0 else "over",
-            "the range high $%.2f" % lvl if setup == "orb" else "the level $%.2f" % lvl,
+            "%s $%.2f" % (level_word(setup), lvl),
             100.0 * (last["c"] / lvl - 1))
     return res
+
+
+def level_word(setup):
+    return {"orb": "the range high", "sr": "resistance"}.get(setup, "the level")
 
 
 def public(res):
@@ -566,7 +707,8 @@ def entry_doc(res, now_utc):
             "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
             "interval": res["interval"],
             "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
-            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason"),
+            **({"levels": res["levels"]} if res.get("levels") else {})}
 
 
 def write_json(path, doc):
@@ -588,6 +730,8 @@ SHORT = {"pre-open": "not open", "forming": "forming", "closed": "closed"}
 def setup_name(res):
     if res["setup"] == "orb":
         return "opening-range breakout (%d-minute range)" % res["or_minutes"]
+    if res["setup"] == "sr":
+        return "resistance breakout (after the %d-minute range)" % res["or_minutes"]
     return "close above $%.2f" % res["level"] if res["level"] is not None else "close above a level"
 
 
@@ -607,12 +751,16 @@ def describe(res):
         out.append("Opening range %s-%s: high $%.2f, low $%.2f (%d of %d bars%s)." % (
             short(start), short(end), orr["high"], orr["low"], orr["bars"], orr["of"],
             "" if orr["complete"] else ", still forming"))
+    z = res.get("zone")
+    if z:
+        out.append("Resistance to beat: $%.2f-$%.2f (%s); it needs a close above $%.2f." % (
+            z["low"], z["high"], ", ".join(z["kinds"]), z["high"]))
     label = PHASE_LABEL.get(res["phase"]) or LABEL.get(res["status"], res["status"].upper())
     t = res.get("trigger")
     if t:
         out.append("TRIGGERED %s at $%.2f: the %s bar (bar %d) closed above %s $%.2f (%+.2f%%%s)." % (
             t["time"], t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
-            "the range high" if res["setup"] == "orb" else "the level", res["level"], t["pct_over"],
+            level_word(res["setup"]), res["level"], t["pct_over"],
             (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
         step = INTERVALS[res["interval"]] // 60
         if res.get("minutes_since", 0) > step and res.get("last"):
@@ -639,11 +787,47 @@ def describe(res):
             out.append("No entry on this setup today. Nothing was placed.")
         if res.get("next_open"):
             out.append("Next open: %s New York." % res["next_open"])
+    out.extend(level_lines(res))
     if res.get("early_close"):
         out.append("Early close today at 1:00 p.m. (%s): no new entries after %s." % (
             res["early_close"], res["no_entries_after"]))
     if not res.get("calendar_known"):
         out.append("Holiday list covers %s only: check nyse.com for this date." % " and ".join(map(str, CALENDAR_YEARS)))
+    return out
+
+
+def zone_text(z):
+    where = "$%.2f" % z["mid"] if z["low"] == z["high"] else "$%.2f-$%.2f" % (z["low"], z["high"])
+    return "%s (%s)" % (where, ", ".join(z["kinds"]))
+
+
+def level_lines(res):
+    """Support and resistance in plain lines, when they were asked for."""
+    if "levels" not in res:
+        return []
+    lv = res["levels"]
+    if not lv:
+        if res["setup"] == "sr":
+            return []       # the status line already says so
+        return ["Support/resistance: no prior sessions in the data (Yahoo range=5d or longer needed)."]
+    pd = lv["prev_day"]
+    out = ["Support/resistance from the last %d sessions (%s to %s), around $%.2f; prior day %s: "
+           "high $%.2f, low $%.2f, close $%.2f." % (len(lv["sessions"]), lv["sessions"][0], lv["sessions"][-1],
+                                                     lv["price"], pd["date"], pd["high"], pd["low"], pd["close"])]
+    if lv.get("inside"):
+        out.append("  The price is inside the zone %s." % zone_text(lv["inside"]))
+    out.append("  Resistance: %s." % ("; ".join(zone_text(z) for z in lv["resistance"])
+                                      or "none above, the price is over every level in these sessions"))
+    out.append("  Support:    %s." % ("; ".join(zone_text(z) for z in lv["support"])
+                                      or "none below, the price is under every level in these sessions"))
+    if lv.get("room") is not None:
+        out.append("  Room to the next resistance: $%.2f (%+.2f%%). A target past it has to get through it." % (
+            lv["room"], lv["room_pct"]))
+    if res.get("trigger") and lv["support"]:
+        s = lv["support"][0]
+        out.append("  Nearest support $%.2f: a stop under it is /trader-exit --stop price:%.2f (your call)." % (
+            s["low"], round(s["low"] - 0.01, 2)))
+    out.append("  Levels are where price turned before, not a forecast.")
     return out
 
 
@@ -654,7 +838,7 @@ def bar_line(b, res):
     lvl = res.get("level")
     t = res.get("trigger")
     n_or = orr.get("of") or 0
-    if res["setup"] == "orb" and b["slot"] < n_or:
+    if res["setup"] in ("orb", "sr") and b["slot"] < n_or:
         seen = [x for x in res["_bars"] if x["slot"] <= b["slot"]]
         note = "range so far $%.2f to $%.2f" % (min(x["l"] for x in seen), max(x["h"] for x in seen))
         if b["slot"] == n_or - 1:
@@ -784,14 +968,23 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
 def _opts(a, cfg):
     if a.side in ("sell", "short"):
         raise EntryError("v2 plans longs only: no short entries. Watch for a buy (--side buy) instead.")
-    if a.setup == "orb" and a.level is not None:
-        raise EntryError("--level is for --setup level (an orb's level is its range high)")
+    if a.setup in ("orb", "sr") and a.level is not None:
+        raise EntryError("--level is for --setup level (an orb's level is its range high, an sr's the resistance)")
+    if a.sr_days is not None and not 1 <= a.sr_days <= 58:
+        raise EntryError("--sr-days is 1 to 58 sessions (Yahoo keeps 5-minute bars for about 60 days)")
     if a.min_volume_x is not None and a.min_volume_x <= 0:
         raise EntryError("--min-volume-x must be above 0")
     if a.level is not None and a.level <= 0:
         raise EntryError("--level must be a price above 0")
     return {"setup": a.setup, "or_minutes": a.or_minutes, "interval": a.interval, "level": a.level,
-            "min_volume_x": a.min_volume_x, "cfg": cfg}
+            "min_volume_x": a.min_volume_x, "cfg": cfg, "sr_days": sr_days_of(a)}
+
+
+def sr_days_of(a):
+    """Prior sessions to read for support/resistance: 0 when nobody asked for them."""
+    if a.setup == "sr" or a.levels or a.sr_days is not None:
+        return a.sr_days or SR_DAYS
+    return 0
 
 
 def _load(a, sym, now):
@@ -801,7 +994,7 @@ def _load(a, sym, now):
         ch = get_chart(sym, a.interval, offline=a.offline)
         return ch, (utc_of(ch["data_time"]) if ch.get("data_time") else utc_now())
     now = now or utc_now()
-    return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today), now
+    return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today, sr_days_of(a)), now
 
 
 def cmd_check(a):
@@ -839,7 +1032,7 @@ def cmd_watch(a):
     real_today = to_eastern(utc_now()).date()
 
     def provider(now):
-        return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today)
+        return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today, sr_days_of(a))
 
     until = None
     if a.until:
@@ -916,11 +1109,13 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
 
     def common(p):
-        p.add_argument("--setup", choices=["orb", "level"], default="orb")
+        p.add_argument("--setup", choices=["orb", "level", "sr"], default="orb")
         p.add_argument("--or-minutes", type=int, default=15, help="opening range length (default 15)")
         p.add_argument("--interval", choices=["5m", "1m"], default="5m")
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")
         p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs the range bars' average")
+        p.add_argument("--levels", action="store_true", help="also show support/resistance (sr always does)")
+        p.add_argument("--sr-days", type=int, help="prior sessions for support/resistance (default %d)" % SR_DAYS)
         p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
         p.add_argument("--now", help='pretend it is this New York time, e.g. "2026-10-19 10:15"')
         p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON (.json/.json.gz) or a folder")
