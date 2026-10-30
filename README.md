@@ -1,6 +1,6 @@
 # The Day Trader skill
 
-11 Claude skills for day trading: scan thousands of charts, track breaking news, time every entry and exit, and replay every outcome before you risk a dollar.
+12 Claude skills for day trading: scan thousands of charts, track breaking news, time every entry and exit, replay every outcome before you risk a dollar, and trade KuCoin futures at 1x.
 
 Free, MIT, no signup, no API key. The tools are plain Python that read free
 public data: Yahoo Finance charts, Nasdaq Trader's symbol lists, SEC EDGAR
@@ -57,7 +57,7 @@ The tools need Python 3.8 or newer. Nothing to pip install. The SEC tools
 email in `trader/config.json` (`"sec_user_agent": "Your Name you@example.com"`)
 or in the `SEC_USER_AGENT` environment variable.
 
-## The eleven
+## The twelve
 
 | command | job | what it does |
 | --- | --- | --- |
@@ -72,6 +72,7 @@ or in the `SEC_USER_AGENT` environment variable.
 | `/trader-alerts` | Price Alerts | Rings when a price, a stop or the opening bell hits. |
 | `/trader-analyst` | Earnings Analyst | Reads earnings reports and sums up what changed. |
 | `/trader-pelosi` | Pelosi Tracker | Reads Congress's stock-trade disclosures the minute they are filed. |
+| `/trader-kucoin` | KuCoin Futures | A daily brief and news check, then 30-minute trades long or short at 1x on KuCoin Futures, never without your yes. |
 
 ## How to use it
 
@@ -120,6 +121,25 @@ An example, the trade in the reel: Tesla, Monday October 19 2026, real data.
 9. **`/trader-alerts`** rings on the stop, the target and at 3:55 PM to
    flatten whatever is still open.
 
+## KuCoin Futures
+
+`/trader-kucoin` runs the same idea on KuCoin Futures for trades of about 30
+minutes, long or short, at 1x only:
+
+```
+brief -> news -> check / watch -> plan -> your yes -> order -> time stop (close --plan --wait)
+```
+
+Every day starts with `kucoin.py brief`: KuCoin's status, its announcements
+(delistings, maintenance) and the contracts most tradeable today across
+crypto, stocks, metals and commodities. Then the news check is recorded with
+`kucoin.py news`; no order goes out before it. The setup is a 15-minute range
+breakout on 1-minute bars with volume, trend, support/resistance and funding
+gates. The plan sizes whole contracts to your max loss and closes the trade
+after 30 minutes. Keys go in the environment (`KUCOIN_API_KEY`,
+`KUCOIN_API_SECRET`, `KUCOIN_API_PASSPHRASE`), never in the chat; there is no
+paper mode, so use a sub-account with a small balance.
+
 ## The tools
 
 All standard-library Python. The data tools read public endpoints and are
@@ -143,6 +163,8 @@ python3 trader-alerts/alerts.py add --from-plan                        # stop, t
 python3 trader-alerts/alerts.py check                                  # rings what hit, once
 python3 trader-analyst/facts.py TSLA                                   # quarters, growth, EPS
 python3 trader-pelosi/ptr.py index --member pelosi                     # her PTRs this year
+python3 trader-kucoin/kucoin.py brief                                  # KuCoin: status, news, today's list
+python3 trader-kucoin/kucoin.py check SOL --write                      # 15-minute range breakout, 1x
 ```
 
 ```bash
@@ -161,9 +183,11 @@ arithmetic. It does not know your situation and it cannot see the future.
 Most people who day trade lose money. You can lose money. Decide for
 yourself, and talk to a licensed professional if you need advice.
 
-**No trade goes through until you say yes.** Only `/trader-broker` can lead to
-an order, and only after `/trader-risk` passes that exact order and you type
-yes for it in the chat. Set your brokerage tool to "Needs approval" in Claude
+**No trade goes through until you say yes.** Only `/trader-broker` and
+`/trader-kucoin` can lead to an order. `/trader-broker` only after
+`/trader-risk` passes that exact order and you type yes for it in the chat;
+`/trader-kucoin` only after today's brief and news check, its daily limits,
+and your yes for that ticket. Set your brokerage tool to "Needs approval" in Claude
 (Customize, Connectors, tool permissions), never "Always allow", so Claude's
 own "Allow once / Deny" card is a second check. No options, margin, short
 selling or leverage unless you turn them on.
@@ -212,6 +236,7 @@ trader-broker/      SKILL.md, ticket.py, claude_desktop_config.example.json
 trader-alerts/      SKILL.md, alerts.py, alerts.example.json
 trader-analyst/     SKILL.md, facts.py, metrics.example.json
 trader-pelosi/      SKILL.md, ptr.py
+trader-kucoin/      SKILL.md, kucoin.py, kucoin.example.json
 tests/              unittest suite + offline fixtures
 ```
 

@@ -1,0 +1,20 @@
+{
+  "leverage": 1,
+  "max_loss_per_trade_usdt": 4.0,
+  "max_loss_pct": 1.0,
+  "daily_loss_limit_usdt": 10.0,
+  "max_trades_per_day": 4,
+  "max_position_pct": 50,
+  "hold_minutes": 30,
+  "range_minutes": 15,
+  "min_volume_x": 1.5,
+  "min_room_r": 1.0,
+  "target_r": 1.5,
+  "min_range_pct": 0.15,
+  "max_range_pct": 1.5,
+  "trend_filter": true,
+  "funding_block_minutes": 10,
+  "min_turnover_usdt": 20000000,
+  "min_turnover_other_usdt": 3000000,
+  "plan_max_age_minutes": 3
+}
