@@ -86,7 +86,10 @@ KuCoin Futures). Stocks, metals and commodities too: `TSLA`, `MU`, `XAUT`
 - **Gates**, all of them: volume at least 1.5x the range's average; a range
   0.15 % to 1.5 % wide; with the trend (long over the 5-minute EMA 50, short
   under it); room to the next zone of at least 1R; not in the 10 minutes
-  before a funding time (KuCoin's own, usually every 8 hours).
+  before a funding time (KuCoin's own, usually every 8 hours); and after
+  taker fees in and out (about 0.12 % of the price) the 2R target must still
+  pay 1.2 times the loss. That last gate needs a stop about 0.33 % away, a
+  range about 0.7 % wide: a tighter one is mostly fees.
 - **Zones** come from the 24 hours of 5-minute bars before the range: swing
   highs and lows (30 minutes on each side), the 24-hour high and low, the UTC
   day open; within 0.2 % they merge. Where price turned before, not a forecast.
@@ -102,8 +105,9 @@ KuCoin Futures). Stocks, metals and commodities too: `TSLA`, `MU`, `XAUT`
 
 - **Stop** at the range midpoint by default (`--stop edge` for the far side
   of the range, `price:X`, `pct:X`), rounded to the tick away from the entry.
-- **Target** 1.5R by default (`--target 2R`, `price:X`). It says when the
-  target sits past the next zone.
+- **Target** 2R by default (`--target 3R`, `price:X`). The ticket shows the
+  R after fees too, and a plan under `min_net_r` (1.2) after fees is refused.
+  It says when the target sits past the next zone.
 - **Size** in whole contracts so the loss at the stop, taker fees in and out
   included, fits the smallest of: the max loss per trade, the % of equity,
   what is left of the daily loss limit. At 1x the position's value is its

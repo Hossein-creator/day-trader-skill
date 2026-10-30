@@ -29,7 +29,8 @@ The setup (one rule, long or short):
   gates    volume at least 1.5x the range bars' average; a range between
            0.15 % and 1.5 % of the price; with the trend (long over the 5-minute
            EMA 50, short under it); room to the next zone of at least 1R; not
-           in the 10 minutes before a funding time.
+           in the 10 minutes before a funding time; after taker fees the 2R
+           target still pays at least 1.2R.
 A signal on the newest closed bar is triggered; one or two bars old is late
 (do not chase it); a breakout that fails a gate is blocked, with the reason.
 
@@ -74,7 +75,8 @@ DEFAULTS = {
     "range_minutes": 15,
     "min_volume_x": 1.5,
     "min_room_r": 1.0,
-    "target_r": 1.5,
+    "target_r": 2.0,
+    "min_net_r": 1.2,                 # after taker fees in and out, the target must pay this many times the loss
     "min_range_pct": 0.15,
     "max_range_pct": 1.5,
     "trend_filter": True,
@@ -560,6 +562,11 @@ def evaluate(c, bars1, bars5, now, cfg, side="both"):
     if room is not None and risk > 0 and room < float(cfg["min_room_r"]) * risk:
         gates.append("only %s (%.2fR) to the next %s %s" % (
             fmt(room, tick), room / risk, "resistance" if d == "long" else "support", zone_text(nxt, tick)))
+    fee = 2 * float(c.get("takerFeeRate") or 0.0006) * b["c"]
+    net = (float(cfg["target_r"]) * risk - fee) / (risk + fee) if risk > 0 else 0
+    if net < float(cfg["min_net_r"]):
+        gates.append("after fees the %.1fR target pays only %.2fR (needs %.1fR): the range is too narrow for the fees"
+                     % (float(cfg["target_r"]), net, float(cfg["min_net_r"])))
     end = b["t"] + datetime.timedelta(minutes=1)
     if datetime.timedelta(0) <= fund_at - end <= datetime.timedelta(minutes=int(cfg["funding_block_minutes"])):
         gates.append("funding at %s: no new entries in the %d minutes before" % (
@@ -702,6 +709,10 @@ def build_plan(c, entry, cfg, now, equity=None, log=None, stop="mid", target=Non
     if lots < 1:
         raise KuError("one contract (%s %s) would lose %.2f USDT at the stop, over %.2f (%s): skip this trade "
                       "or take a closer stop" % (mult, base_of(c["symbol"]), per_lot, budget, decided))
+    net_r = (reward * mult - (px + tp) * mult * fee) / per_lot
+    if net_r < float(cfg["min_net_r"]):
+        raise KuError("after fees this trade pays %.2fR at the target, under your %.1fR: the stop is too close "
+                      "for the fees, skip it" % (net_r, float(cfg["min_net_r"])))
     mmr = float(c.get("maintainMargin") or 0.004)
     liq = px * mmr if long_ else px * (2 - mmr)       # isolated 1x: leverage 1 leaves only the maintenance margin
     start = parse_now(entry.get("time")) if entry.get("time") else now
@@ -710,7 +721,7 @@ def build_plan(c, entry, cfg, now, equity=None, log=None, stop="mid", target=Non
     open_side, close_side = ("buy", "sell") if long_ else ("sell", "buy")
     plan = {"created_by": "trader-kucoin", "id": oid, "symbol": c["symbol"], "base": base_of(c["symbol"]),
             "side": side, "date": day, "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "entry": px, "stop": sp, "target": tp, "risk_per_unit": r(risk, 10), "r_multiple": r(reward / risk),
+            "entry": px, "stop": sp, "target": tp, "risk_per_unit": r(risk, 10), "r_multiple": r(reward / risk), "net_r": r(net_r),
             "lots": lots, "multiplier": mult, "size_units": r(lots * mult, 8), "notional_usdt": r(lots * mult * px),
             "margin_usdt": r(lots * mult * px), "leverage": 1, "margin_mode": "ISOLATED",
             "max_loss": r(lots * per_lot), "fees_est": r(lots * (px + sp) * mult * fee),
@@ -741,8 +752,8 @@ def ticket(p):
     out = ["TICKET %s  %s %s, %d contract%s = %s %s, market, isolated 1x" % (
         p["id"], word, p["symbol"], p["lots"], "s" if p["lots"] > 1 else "", p["size_units"], p["base"]),
         "  entry about %s (value %.2f USDT, margin %.2f USDT)" % (fmt(p["entry"], t), p["notional_usdt"], p["margin_usdt"]),
-        "  stop-loss %s, take-profit %s (%.2fR), both on the last price, both close the position" % (
-            fmt(p["stop"], t), fmt(p["target"], t), p["r_multiple"]),
+        "  stop-loss %s, take-profit %s (%.2fR, %.2fR after fees), both on the last price, both close the position" % (
+            fmt(p["stop"], t), fmt(p["target"], t), p["r_multiple"], p.get("net_r") or 0),
         "  max loss at the stop %.2f USDT incl. fees (%s decided the size); at the target +%.2f USDT" % (
             p["max_loss"], p["decided_by"], p["reward_at_target"]),
         "  time stop: close at market by %s" % stamp(parse_now(p["close_by"])),
@@ -1340,7 +1351,7 @@ def main(argv=None):
     p.add_argument("--side", choices=["long", "short"])
     p.add_argument("--entry", type=float)
     p.add_argument("--stop", default="mid", help="mid (default), edge, price:X, pct:X")
-    p.add_argument("--target", help="1.5R (default from config), 2R, price:X")
+    p.add_argument("--target", help="2R (default from config), 3R, price:X")
     p.add_argument("--equity", type=float, help="account equity in USDT (else read from KuCoin)")
     p.add_argument("--log", default="trader/kucoin-log.json")
     p.add_argument("--write", nargs="?", const="trader/kucoin-plan.json", metavar="PATH")

@@ -224,6 +224,13 @@ class Setup(unittest.TestCase):
         self.assertEqual(res["status"], "blocked")
         self.assertTrue(any("to the next resistance" in x for x in res["reasons"]), res["reasons"])
 
+    def test_fee_gate(self):
+        b1, b5 = synthetic(self.now, breakout=100.55)             # 0.30 to the mid: fees take too much
+        res = ku.evaluate(sol(), b1, b5, self.now, self.cfg())
+        self.assertEqual(res["status"], "blocked")
+        self.assertTrue(any("after fees" in x for x in res["reasons"]), res["reasons"])
+        self.assertEqual(ku.evaluate(sol(), b1, b5, self.now, self.cfg(min_net_r=0.5))["status"], "triggered")
+
     def test_zones_merge_and_need_two_touches(self):
         t = DT(2026, 10, 29, 0, 0)
         bars = []
@@ -246,8 +253,9 @@ class Plan(unittest.TestCase):
 
     def test_long_plan(self):
         p = ku.build_plan(sol(), self.entry(), dict(ku.DEFAULTS), self.now, equity=1000)
-        self.assertEqual((p["stop"], p["target"]), (100.25, 101.625))
-        self.assertEqual(p["r_multiple"], 1.5)
+        self.assertEqual((p["stop"], p["target"]), (100.25, 101.9))
+        self.assertEqual(p["r_multiple"], 2.0)
+        self.assertGreaterEqual(p["net_r"], 1.2)
         self.assertEqual(p["leverage"], 1)
         self.assertEqual(p["close_by"], "2026-10-29T14:30:00Z")
         self.assertLessEqual(p["max_loss"], 4.0)
@@ -287,6 +295,14 @@ class Plan(unittest.TestCase):
         with self.assertRaises(ku.KuError) as cm:
             ku.build_plan(sol(), self.entry(), dict(ku.DEFAULTS), self.now, log=log)
         self.assertIn("daily limit", str(cm.exception))
+
+    def test_fees_eat_a_tight_stop(self):
+        e = self.entry()
+        e["range"] = {"high": 100.8, "low": 100.6, "mid": 100.7}      # 0.10 to the stop, 0.12 in fees
+        with self.assertRaises(ku.KuError) as cm:
+            ku.build_plan(sol(), e, dict(ku.DEFAULTS), self.now)
+        self.assertIn("after fees", str(cm.exception))
+        ku.build_plan(sol(), e, dict(ku.DEFAULTS, min_net_r=0.1, target_r=3), self.now)
 
     def test_ready_to_send(self):
         p = ku.build_plan(sol(), self.entry(), dict(ku.DEFAULTS), self.now)
@@ -451,7 +467,8 @@ class Manual(unittest.TestCase):
             self.assertEqual(code, 0, err)
             self.assertIn("In the KuCoin app: Futures > SOLUSDT Perpetual.", text)
             self.assertIn("Isolated, leverage 1x", text)
-            self.assertIn("take-profit 103.398, stop-loss 101.568", text)
+            self.assertIn("take-profit 103.764, stop-loss 101.568", text)
+            self.assertIn("1.57R after fees", text)
             with open(j("plan.json")) as fh:
                 p = json.load(fh)
             self.assertLessEqual(p["max_loss"], 0.788)                 # 1 % of 78.80
@@ -462,7 +479,7 @@ class Manual(unittest.TestCase):
             self.assertEqual(code, 0, err)
             self.assertIn("Time stop at 15:20 UTC (16:20 Berlin)", text)
             self.assertEqual(run(["placed", "--plan", j("plan.json"), "--log", j("log.json")] + cfg)[0], 1)
-            code, text, err = run(["result", "SOL", "--exit", "103.398", "--log", j("log.json"), "--now", "2026-10-29 15:02"])
+            code, text, err = run(["result", "SOL", "--exit", "103.764", "--log", j("log.json"), "--now", "2026-10-29 15:02"])
             self.assertEqual(code, 0, err)
             self.assertIn("(target)", text)
             code, text, err = run(["report", "--log", j("log.json"), "--now", "2026-10-30 12:00"] + cfg)
